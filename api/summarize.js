@@ -3,7 +3,7 @@ import { GoogleGenAI } from "@google/genai";
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({
-      error: "Method not allowed",
+      error: "Method not allowed"
     });
   }
 
@@ -12,7 +12,7 @@ export default async function handler(req, res) {
 
     if (!apiKey) {
       return res.status(500).json({
-        error: "GEMINI_API_KEY is missing",
+        error: "GEMINI_API_KEY is missing in Vercel Production"
       });
     }
 
@@ -20,33 +20,54 @@ export default async function handler(req, res) {
 
     if (!text || !text.trim()) {
       return res.status(400).json({
-        error: "No document text was provided.",
+        error: "No document text provided"
       });
     }
 
     const ai = new GoogleGenAI({
-      apiKey,
+      apiKey
     });
 
     let instruction;
 
     if (length === "short") {
       instruction = `
-Create a short and clear summary of the document.
-Use 4-6 bullet points.
-Include only the most important information.
+### Summary
+Give 4-5 concise sentences.
+
+### Key Points
+Give exactly 5 bullet points.
+
+### Improvement Suggestions
+Give exactly 2 bullet points.
+
+Keep the complete response under 350 words.
 `;
     } else if (length === "long") {
       instruction = `
-Create a detailed summary of the document.
-Organize it using clear headings and bullet points.
-Include important facts, key ideas, findings, and conclusions.
+### Summary
+Give 2-3 concise paragraphs.
+
+### Key Points
+Give exactly 7 bullet points.
+
+### Improvement Suggestions
+Give exactly 3 bullet points.
+
+Keep the complete response under 700 words.
 `;
     } else {
       instruction = `
-Create a medium-length summary of the document.
-Use clear headings and bullet points.
-Include the important ideas without unnecessary details.
+### Summary
+Give 1-2 concise paragraphs.
+
+### Key Points
+Give exactly 6 bullet points.
+
+### Improvement Suggestions
+Give exactly 3 bullet points.
+
+Keep the complete response under 500 words.
 `;
     }
 
@@ -55,30 +76,42 @@ You are a document summarization assistant.
 
 ${instruction}
 
-Do not invent information.
-Use only information present in the provided document.
+Rules:
+- Use only information from the document.
+- Do not invent facts.
+- Preserve important names, dates and numbers.
+- Finish every section completely.
+- Keep the answer concise.
 
 DOCUMENT:
 ${text}
 `;
 
     const response = await ai.models.generateContent({
-      model: "gemini-3.6-flash",
+      model: "gemini-3.7-flash",
       contents: prompt,
+      config: {
+        maxOutputTokens: 1400,
+        temperature: 0.3
+      }
     });
 
-    const summary = response.text;
+    const summary = response.text?.trim();
+
+    if (!summary) {
+      return res.status(500).json({
+        error: "Gemini returned an empty response"
+      });
+    }
 
     return res.status(200).json({
-      summary,
+      summary
     });
   } catch (error) {
     console.error("Gemini API error:", error);
 
     return res.status(500).json({
-      error:
-        error?.message ||
-        "Failed to generate summary.",
+      error: error?.message || "Gemini API request failed"
     });
   }
 }
