@@ -2,23 +2,115 @@ import { useState } from "react";
 import "./App.css";
 import { extractTextFromPDF } from "./services/pdfExtractor";
 import { extractTextFromImage } from "./services/ocrService";
-import { generateSummary } from "./services/summaryService";
+
+function createLocalSummary(text, length) {
+  const cleanText = text
+    .replace(/--- Page \d+ ---/g, "\n")
+    .replace(/\r/g, "")
+    .trim();
+
+  const lines = cleanText
+    .split(/\n|•/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => line.length > 25);
+
+  const uniqueLines = [...new Set(lines)];
+
+  let summaryCount = 4;
+  let keyPointCount = 5;
+
+  if (length === "short") {
+    summaryCount = 3;
+    keyPointCount = 5;
+  } else if (length === "long") {
+    summaryCount = 7;
+    keyPointCount = 7;
+  } else {
+    summaryCount = 4;
+    keyPointCount = 6;
+  }
+
+  const summaryLines = uniqueLines.slice(0, summaryCount);
+  const keyPoints = uniqueLines.slice(0, keyPointCount);
+
+  const summary =
+    summaryLines.length > 0
+      ? summaryLines.join(" ")
+      : cleanText.substring(0, 1000);
+
+  return `### Summary
+
+${summary}
+
+### Key Points
+
+${keyPoints
+  .map((point) => `• ${point}`)
+  .join("\n")}
+
+### Improvement Suggestions
+
+• Organize the document into clearly defined sections.
+• Reduce repeated information and keep the most relevant details.
+• Add measurable results or supporting details where appropriate.`;
+}
+
+async function generateGeminiSummary(text, length) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 7000);
+
+  try {
+    const response = await fetch("/api/summarize", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        text,
+        length
+      }),
+      signal: controller.signal
+    });
+
+    const contentType =
+      response.headers.get("content-type") || "";
+
+    if (!contentType.includes("application/json")) {
+      throw new Error("Invalid server response");
+    }
+
+    const data = await response.json();
+
+    if (!response.ok || !data.summary) {
+      throw new Error(
+        data.error || "Gemini summary unavailable"
+      );
+    }
+
+    return data.summary;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 function App() {
   const [file, setFile] = useState(null);
   const [error, setError] = useState("");
   const [extractedText, setExtractedText] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [ocrProgress, setOcrProgress] = useState(0);
-
   const [summary, setSummary] = useState("");
-  const [summaryLength, setSummaryLength] = useState("medium");
+  const [loading, setLoading] = useState(false);
   const [summaryLoading, setSummaryLoading] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [summaryLength, setSummaryLength] = useState("medium");
 
   const handleFile = async (selectedFile) => {
     setError("");
     setExtractedText("");
     setSummary("");
+    setOcrProgress(0);
 
     if (!selectedFile) return;
 
@@ -30,110 +122,153 @@ function App() {
     ];
 
     if (!allowedTypes.includes(selectedFile.type)) {
-      setError("Please upload a PDF, PNG, or JPG file.");
+      setError("Please upload a PDF, PNG, JPG, or JPEG file.");
+      return;
+    }
+
+    if (selectedFile.size > 10 * 1024 * 1024) {
+      setError("File size must be less than 10 MB.");
       return;
     }
 
     setFile(selectedFile);
+    setLoading(true);
 
-    if (selectedFile.type === "application/pdf") {
-      try {
-        setLoading(true);
+    try {
+      let text = "";
 
-        const text = await extractTextFromPDF(selectedFile);
-
-        if (!text) {
-          setError(
-            "No readable text found in this PDF. This may be a scanned document."
-          );
-        } else {
-          setExtractedText(text);
-        }
-      } catch (err) {
-        console.error("PDF ERROR:", err);
-        setError(err.message || "Failed to extract text from PDF.");
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    if (selectedFile.type.startsWith("image/")) {
-      try {
-        setLoading(true);
-        setOcrProgress(0);
-
-        const text = await extractTextFromImage(
+      if (selectedFile.type === "application/pdf") {
+        text = await extractTextFromPDF(selectedFile);
+      } else {
+        text = await extractTextFromImage(
           selectedFile,
           setOcrProgress
         );
-
-        if (!text) {
-          setError("No readable text found in this image.");
-        } else {
-          setExtractedText(text);
-        }
-      } catch (err) {
-        console.error("OCR ERROR:", err);
-        setError(err.message || "Failed to extract text from image.");
-      } finally {
-        setLoading(false);
       }
+
+      if (!text) {
+        setError("No readable text found in this document.");
+      } else {
+        setExtractedText(text);
+      }
+    } catch (err) {
+      console.error(err);
+      setError(
+        err.message || "Failed to process the document."
+      );
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleDrop = (e) => {
-    e.preventDefault();
-    handleFile(e.dataTransfer.files[0]);
+  const handleDrop = (event) => {
+    event.preventDefault();
+    handleFile(event.dataTransfer.files[0]);
   };
 
-  const handleGenerateSummary = async () => {
+  const generateSummary = async () => {
     if (!extractedText) {
-      setError("Please upload a document with readable text first.");
+      setError("Please upload a document first.");
       return;
     }
 
-    try {
-      setError("");
-      setSummary("");
-      setSummaryLoading(true);
+    setError("");
+    setSummary("");
+    setSummaryLoading(true);
 
-      const result = await generateSummary(
-        extractedText,
-        summaryLength
-      );
+    try {
+      let result;
+
+      try {
+        result = await generateGeminiSummary(
+          extractedText,
+          summaryLength
+        );
+      } catch (geminiError) {
+        console.warn(
+          "Gemini unavailable. Using local fallback.",
+          geminiError
+        );
+
+        result = createLocalSummary(
+          extractedText,
+          summaryLength
+        );
+      }
 
       setSummary(result);
     } catch (err) {
-      console.error("SUMMARY ERROR:", err);
-      setError(
-        err.message || "Failed to generate summary."
-      );
+      console.error(err);
+      setError("Unable to generate a summary.");
     } finally {
       setSummaryLoading(false);
     }
+  };
+
+  const copySummary = async () => {
+    try {
+      await navigator.clipboard.writeText(summary);
+    } catch {
+      setError("Unable to copy summary.");
+    }
+  };
+
+  const downloadSummary = () => {
+    const blob = new Blob([summary], {
+      type: "text/plain"
+    });
+
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = "document-summary.txt";
+
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+
+    URL.revokeObjectURL(url);
+  };
+
+  const clearDocument = () => {
+    setFile(null);
+    setError("");
+    setExtractedText("");
+    setSummary("");
+    setLoading(false);
+    setSummaryLoading(false);
+    setOcrProgress(0);
   };
 
   return (
     <div className="app">
       <div className="container">
 
-        <h1>Document Summary Assistant</h1>
+        <div className="header">
+          <div className="logo">📄</div>
 
-        <p className="subtitle">
-          Upload a PDF or image and generate a smart summary
-        </p>
+          <h1>Document Summary Assistant</h1>
+
+          <p>
+            Upload a PDF or image and generate a smart summary
+          </p>
+        </div>
 
         <div
           className="upload-box"
-          onDragOver={(e) => e.preventDefault()}
+          onDragOver={(event) =>
+            event.preventDefault()
+          }
           onDrop={handleDrop}
         >
-          <div className="upload-icon">📄</div>
+          <div className="upload-icon">📁</div>
 
           <h2>Upload your document</h2>
 
           <p>Drag & drop your file here</p>
-          <p>or</p>
+
+          <span className="or">or</span>
 
           <label className="choose-btn">
             Choose File
@@ -141,15 +276,15 @@ function App() {
             <input
               type="file"
               accept=".pdf,.png,.jpg,.jpeg"
-              onChange={(e) =>
-                handleFile(e.target.files[0])
+              onChange={(event) =>
+                handleFile(event.target.files[0])
               }
               hidden
             />
           </label>
 
           <p className="file-types">
-            Supported: PDF, PNG, JPG, JPEG
+            Supported: PDF, PNG, JPG, JPEG · Max 10 MB
           </p>
         </div>
 
@@ -162,16 +297,24 @@ function App() {
 
         {file && (
           <div className="file-info">
-            <h3>Selected File</h3>
+            <div>
+              <h3>Selected File</h3>
 
-            <p>
-              <strong>Name:</strong> {file.name}
-            </p>
+              <p className="file-name">
+                {file.name}
+              </p>
 
-            <p>
-              <strong>Size:</strong>{" "}
-              {(file.size / 1024).toFixed(2)} KB
-            </p>
+              <p>
+                {(file.size / 1024).toFixed(2)} KB
+              </p>
+            </div>
+
+            <button
+              className="clear-btn"
+              onClick={clearDocument}
+            >
+              Clear
+            </button>
           </div>
         )}
 
@@ -191,18 +334,17 @@ function App() {
           </div>
         )}
 
-        {extractedText && (
-          <div className="summary-controls">
+        {extractedText && !loading && (
+          <div className="summary-section">
+            <h2>Summary Length</h2>
 
-            <h3>Summary Length</h3>
-
-            <div className="length-options">
+            <div className="summary-options">
 
               <button
                 className={
                   summaryLength === "short"
-                    ? "active"
-                    : ""
+                    ? "length-btn active"
+                    : "length-btn"
                 }
                 onClick={() =>
                   setSummaryLength("short")
@@ -214,8 +356,8 @@ function App() {
               <button
                 className={
                   summaryLength === "medium"
-                    ? "active"
-                    : ""
+                    ? "length-btn active"
+                    : "length-btn"
                 }
                 onClick={() =>
                   setSummaryLength("medium")
@@ -227,8 +369,8 @@ function App() {
               <button
                 className={
                   summaryLength === "long"
-                    ? "active"
-                    : ""
+                    ? "length-btn active"
+                    : "length-btn"
                 }
                 onClick={() =>
                   setSummaryLength("long")
@@ -240,30 +382,43 @@ function App() {
             </div>
 
             <button
-              className="generate-btn"
-              onClick={handleGenerateSummary}
+              className="summary-btn"
+              onClick={generateSummary}
               disabled={summaryLoading}
             >
               {summaryLoading
                 ? "Generating Summary..."
-                : "Generate Summary"}
+                : "✨ Generate Summary"}
             </button>
-
           </div>
         )}
 
         {summaryLoading && (
           <div className="loading">
-            Gemini is analyzing your document...
+            AI is analyzing your document...
           </div>
         )}
 
         {summary && (
           <div className="summary-result">
 
-            <h2>Smart Summary</h2>
+            <div className="summary-header">
+              <h2>Smart Summary</h2>
 
-            <pre>{summary}</pre>
+              <div className="summary-actions">
+                <button onClick={copySummary}>
+                  Copy
+                </button>
+
+                <button onClick={downloadSummary}>
+                  Download
+                </button>
+              </div>
+            </div>
+
+            <div className="summary-text">
+              {summary}
+            </div>
 
           </div>
         )}
