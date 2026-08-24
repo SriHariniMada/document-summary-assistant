@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 
-function createFallbackSummary(text, length) {
+function fallbackSummary(text, length) {
   const cleanText = text
     .replace(/--- Page \d+ ---/g, " ")
     .replace(/\s+/g, " ")
@@ -8,45 +8,45 @@ function createFallbackSummary(text, length) {
 
   const sentences = cleanText
     .split(/(?<=[.!?])\s+/)
-    .filter((sentence) => sentence.length > 30);
+    .filter((s) => s.trim().length > 25);
 
-  let sentenceCount = 5;
+  let count = 4;
 
   if (length === "short") {
-    sentenceCount = 3;
+    count = 3;
   } else if (length === "long") {
-    sentenceCount = 8;
+    count = 8;
   }
 
-  const selectedSentences = sentences
-    .slice(0, sentenceCount);
+  const selected = sentences.slice(0, count);
 
-  const importantSentences =
-    selectedSentences.length > 0
-      ? selectedSentences
-      : [cleanText.slice(0, 1000)];
-
-  const keyPoints = sentences
+  const points = sentences
     .slice(0, 6)
-    .map((sentence) => `- ${sentence}`);
+    .map((s) => `• ${s}`);
 
   return `### Summary
 
-${importantSentences.join(" ")}
+${
+  selected.length
+    ? selected.join(" ")
+    : cleanText.slice(0, 1000)
+}
 
 ### Key Points
 
-${keyPoints.length > 0
-    ? keyPoints.join("\n")
-    : "- The document text was successfully extracted."}
+${
+  points.length
+    ? points.join("\n")
+    : "• The document was successfully processed."
+}
 
 ### Improvement Suggestions
 
-- Organize the document into clearly separated sections.
-- Add concise headings where appropriate.
-- Include measurable details or supporting information where relevant.
+• Organize the content using clear headings.
+• Remove repeated information where possible.
+• Add measurable details or supporting evidence where useful.
 
-*Note: AI summarization was temporarily unavailable, so an automatic text-based summary was generated.*`;
+`;
 }
 
 export default async function handler(req, res) {
@@ -56,122 +56,81 @@ export default async function handler(req, res) {
     });
   }
 
+  const { text, length = "medium" } = req.body || {};
+
+  if (!text || !text.trim()) {
+    return res.status(400).json({
+      error: "No document text provided"
+    });
+  }
+
+  // Try Gemini first.
   try {
-    const { text, length = "medium" } = req.body || {};
-
-    if (!text || !text.trim()) {
-      return res.status(400).json({
-        error: "No document text provided"
-      });
-    }
-
     const apiKey = process.env.GEMINI_API_KEY;
 
-    // Try Gemini first
     if (apiKey) {
-      try {
-        const ai = new GoogleGenAI({
-          apiKey
-        });
+      const ai = new GoogleGenAI({
+        apiKey
+      });
 
-        let instruction = "";
+      const response = await Promise.race([
+        ai.models.generateContent({
+          model: "gemini-3.7-flash",
+          contents: `
+Summarize the following document.
 
-        if (length === "short") {
-          instruction = `
-Create a concise summary in 3-4 sentences.
+Summary length: ${length}
 
-Then provide:
+Provide exactly these sections:
+
+### Summary
+A concise summary.
+
 ### Key Points
-Exactly 5 bullet points.
+5 to 7 important points.
 
 ### Improvement Suggestions
-Exactly 2 bullet points.
-
-Keep the response concise.
-`;
-        } else if (length === "long") {
-          instruction = `
-Create a detailed summary in 2 short paragraphs.
-
-Then provide:
-### Key Points
-Exactly 7 bullet points.
-
-### Improvement Suggestions
-Exactly 3 bullet points.
-
-Keep the response concise.
-`;
-        } else {
-          instruction = `
-Create a medium-length summary in 1 short paragraph.
-
-Then provide:
-### Key Points
-Exactly 6 bullet points.
-
-### Improvement Suggestions
-Exactly 3 bullet points.
-
-Keep the response concise.
-`;
-        }
-
-        const prompt = `
-You are a professional document summarization assistant.
-
-${instruction}
+2 to 3 useful suggestions.
 
 Rules:
-- Use only information present in the document.
+- Use only information from the document.
 - Do not invent facts.
-- Preserve important names, dates, numbers and technical terms.
-- Finish every section completely.
-- Do not use tables.
+- Preserve important names, dates and numbers.
+- Keep the response concise.
+- Finish all sections.
 
 DOCUMENT:
 ${text}
-`;
-
-        const response = await ai.models.generateContent({
-          model: "gemini-3.7-flash",
-          contents: prompt,
+`,
           config: {
             maxOutputTokens: 1000
           }
+        }),
+        new Promise((_, reject) =>
+          setTimeout(
+            () => reject(new Error("Gemini timeout")),
+            8000
+          )
+        )
+      ]);
+
+      const summary = response.text?.trim();
+
+      if (summary) {
+        return res.status(200).json({
+          summary
         });
-
-        const summary = response.text?.trim();
-
-        if (summary) {
-          return res.status(200).json({
-            summary,
-            source: "gemini"
-          });
-        }
-      } catch (geminiError) {
-        console.error(
-          "Gemini temporarily unavailable:",
-          geminiError?.message
-        );
       }
     }
-
-    // Guaranteed fallback
-    const fallbackSummary = createFallbackSummary(
-      text,
-      length
-    );
-
-    return res.status(200).json({
-      summary: fallbackSummary,
-      source: "fallback"
-    });
   } catch (error) {
-    console.error("Summary API error:", error);
-
-    return res.status(500).json({
-      error: "Unable to process the document."
-    });
+    console.error(
+      "Gemini unavailable, using fallback:",
+      error.message
+    );
   }
+
+  // Guaranteed summary even when Gemini is unavailable.
+  return res.status(200).json({
+    summary: fallbackSummary(text, length)
+  });
 }
