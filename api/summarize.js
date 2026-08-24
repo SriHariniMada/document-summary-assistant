@@ -1,5 +1,54 @@
 import { GoogleGenAI } from "@google/genai";
 
+const sleep = (ms) =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+async function generateWithRetry(ai, model, prompt) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          maxOutputTokens: 900
+        }
+      });
+
+      const text = response.text?.trim();
+
+      if (text) {
+        return text;
+      }
+
+      throw new Error("Empty response from Gemini");
+    } catch (error) {
+      lastError = error;
+
+      const status =
+        error?.status ||
+        error?.statusCode ||
+        error?.code;
+
+      console.error(
+        `Gemini ${model} attempt ${attempt} failed:`,
+        status,
+        error?.message
+      );
+
+      if (status === 503 || status === 429) {
+        await sleep(attempt * 2000);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  throw lastError;
+}
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({
@@ -16,7 +65,7 @@ export default async function handler(req, res) {
       });
     }
 
-    const { text, length } = req.body || {};
+    const { text, length = "medium" } = req.body || {};
 
     if (!text || !text.trim()) {
       return res.status(400).json({
@@ -24,97 +73,97 @@ export default async function handler(req, res) {
       });
     }
 
-    const ai = new GoogleGenAI({ apiKey });
+    const ai = new GoogleGenAI({
+      apiKey
+    });
 
-    const instructions = {
-      short: `
+    let instruction;
+
+    if (length === "short") {
+      instruction = `
+Give:
 ### Summary
-Give 4-5 concise sentences.
+3-4 sentences.
 
 ### Key Points
-Give exactly 5 bullet points.
+Exactly 5 bullets.
 
 ### Improvement Suggestions
-Give exactly 2 bullet points.
-
-Keep the complete response below 350 words.
-`,
-      medium: `
+Exactly 2 bullets.
+`;
+    } else if (length === "long") {
+      instruction = `
+Give:
 ### Summary
-Give 1-2 concise paragraphs.
+2 short paragraphs.
 
 ### Key Points
-Give exactly 6 bullet points.
+Exactly 7 bullets.
 
 ### Improvement Suggestions
-Give exactly 3 bullet points.
-
-Keep the complete response below 500 words.
-`,
-      long: `
+Exactly 3 bullets.
+`;
+    } else {
+      instruction = `
+Give:
 ### Summary
-Give 2-3 concise paragraphs.
+1 short paragraph.
 
 ### Key Points
-Give exactly 7 bullet points.
+Exactly 6 bullets.
 
 ### Improvement Suggestions
-Give exactly 3 bullet points.
-
-Keep the complete response below 700 words.
-`
-    };
+Exactly 3 bullets.
+`;
+    }
 
     const prompt = `
-You are a professional document summarization assistant.
+You are a document summarization assistant.
 
-${instructions[length] || instructions.medium}
+${instruction}
 
 Rules:
-- Use only information present in the document.
+- Use ONLY information from the document.
 - Do not invent facts.
-- Preserve important names, dates, numbers and technical terms.
-- Finish every section completely.
 - Keep the answer concise.
+- Finish every section.
+- Preserve important names, dates and numbers.
+- Do not use tables.
 
 DOCUMENT:
 ${text}
 `;
 
+    // Try the latest stable aliases/models in sequence.
     const models = [
-      "gemini-3.7-flash",
+      "gemini-flash-latest",
+      "gemini-flash-lite-latest",
       "gemini-3.6-flash",
-      "gemini-3.5-flash"
+      "gemini-2.5-flash"
     ];
 
-    let lastError = null;
+    let finalError = null;
 
     for (const model of models) {
       try {
-        const response = await ai.models.generateContent({
+        const summary = await generateWithRetry(
+          ai,
           model,
-          contents: prompt,
-          config: {
-            maxOutputTokens: 1400
-          }
+          prompt
+        );
+
+        return res.status(200).json({
+          summary
         });
-
-        const summary = response.text?.trim();
-
-        if (summary) {
-          return res.status(200).json({
-            summary,
-            model
-          });
-        }
       } catch (error) {
-        lastError = error;
+        finalError = error;
 
-        const status = error?.status || error?.statusCode;
+        const status =
+          error?.status ||
+          error?.statusCode ||
+          error?.code;
 
-        console.error(`Gemini ${model} failed:`, error);
-
-        // Try the next model for temporary service errors.
+        // Move to the next model only for temporary availability errors.
         if (status === 503 || status === 429) {
           continue;
         }
@@ -125,16 +174,15 @@ ${text}
 
     return res.status(503).json({
       error:
-        "Gemini is temporarily unavailable. Please try again in a moment.",
-      details: lastError?.message || ""
+        "Gemini is temporarily busy. Please try Generate Summary again in a few seconds."
     });
   } catch (error) {
-    console.error("Gemini API error:", error);
+    console.error("Summary API error:", error);
 
     return res.status(500).json({
       error:
         error?.message ||
-        "Failed to generate summary"
+        "Failed to generate summary."
     });
   }
 }
