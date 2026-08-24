@@ -12,7 +12,7 @@ export default async function handler(req, res) {
 
     if (!apiKey) {
       return res.status(500).json({
-        error: "GEMINI_API_KEY is missing in Vercel Production"
+        error: "GEMINI_API_KEY is missing"
       });
     }
 
@@ -24,14 +24,10 @@ export default async function handler(req, res) {
       });
     }
 
-    const ai = new GoogleGenAI({
-      apiKey
-    });
+    const ai = new GoogleGenAI({ apiKey });
 
-    let instruction;
-
-    if (length === "short") {
-      instruction = `
+    const instructions = {
+      short: `
 ### Summary
 Give 4-5 concise sentences.
 
@@ -41,23 +37,9 @@ Give exactly 5 bullet points.
 ### Improvement Suggestions
 Give exactly 2 bullet points.
 
-Keep the complete response under 350 words.
-`;
-    } else if (length === "long") {
-      instruction = `
-### Summary
-Give 2-3 concise paragraphs.
-
-### Key Points
-Give exactly 7 bullet points.
-
-### Improvement Suggestions
-Give exactly 3 bullet points.
-
-Keep the complete response under 700 words.
-`;
-    } else {
-      instruction = `
+Keep the complete response below 350 words.
+`,
+      medium: `
 ### Summary
 Give 1-2 concise paragraphs.
 
@@ -67,19 +49,31 @@ Give exactly 6 bullet points.
 ### Improvement Suggestions
 Give exactly 3 bullet points.
 
-Keep the complete response under 500 words.
-`;
-    }
+Keep the complete response below 500 words.
+`,
+      long: `
+### Summary
+Give 2-3 concise paragraphs.
+
+### Key Points
+Give exactly 7 bullet points.
+
+### Improvement Suggestions
+Give exactly 3 bullet points.
+
+Keep the complete response below 700 words.
+`
+    };
 
     const prompt = `
-You are a document summarization assistant.
+You are a professional document summarization assistant.
 
-${instruction}
+${instructions[length] || instructions.medium}
 
 Rules:
-- Use only information from the document.
+- Use only information present in the document.
 - Do not invent facts.
-- Preserve important names, dates and numbers.
+- Preserve important names, dates, numbers and technical terms.
 - Finish every section completely.
 - Keep the answer concise.
 
@@ -87,31 +81,60 @@ DOCUMENT:
 ${text}
 `;
 
-    const response = await ai.models.generateContent({
-      model: "gemini-3.7-flash",
-      contents: prompt,
-      config: {
-        maxOutputTokens: 1400,
-        temperature: 0.3
+    const models = [
+      "gemini-3.7-flash",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash"
+    ];
+
+    let lastError = null;
+
+    for (const model of models) {
+      try {
+        const response = await ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            maxOutputTokens: 1400
+          }
+        });
+
+        const summary = response.text?.trim();
+
+        if (summary) {
+          return res.status(200).json({
+            summary,
+            model
+          });
+        }
+      } catch (error) {
+        lastError = error;
+
+        const status = error?.status || error?.statusCode;
+
+        console.error(`Gemini ${model} failed:`, error);
+
+        // Try the next model for temporary service errors.
+        if (status === 503 || status === 429) {
+          continue;
+        }
+
+        throw error;
       }
-    });
-
-    const summary = response.text?.trim();
-
-    if (!summary) {
-      return res.status(500).json({
-        error: "Gemini returned an empty response"
-      });
     }
 
-    return res.status(200).json({
-      summary
+    return res.status(503).json({
+      error:
+        "Gemini is temporarily unavailable. Please try again in a moment.",
+      details: lastError?.message || ""
     });
   } catch (error) {
     console.error("Gemini API error:", error);
 
     return res.status(500).json({
-      error: error?.message || "Gemini API request failed"
+      error:
+        error?.message ||
+        "Failed to generate summary"
     });
   }
 }
