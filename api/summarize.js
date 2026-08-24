@@ -1,52 +1,52 @@
 import { GoogleGenAI } from "@google/genai";
 
-const sleep = (ms) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
+function createFallbackSummary(text, length) {
+  const cleanText = text
+    .replace(/--- Page \d+ ---/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
-async function generateWithRetry(ai, model, prompt) {
-  let lastError;
+  const sentences = cleanText
+    .split(/(?<=[.!?])\s+/)
+    .filter((sentence) => sentence.length > 30);
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          maxOutputTokens: 900
-        }
-      });
+  let sentenceCount = 5;
 
-      const text = response.text?.trim();
-
-      if (text) {
-        return text;
-      }
-
-      throw new Error("Empty response from Gemini");
-    } catch (error) {
-      lastError = error;
-
-      const status =
-        error?.status ||
-        error?.statusCode ||
-        error?.code;
-
-      console.error(
-        `Gemini ${model} attempt ${attempt} failed:`,
-        status,
-        error?.message
-      );
-
-      if (status === 503 || status === 429) {
-        await sleep(attempt * 2000);
-        continue;
-      }
-
-      throw error;
-    }
+  if (length === "short") {
+    sentenceCount = 3;
+  } else if (length === "long") {
+    sentenceCount = 8;
   }
 
-  throw lastError;
+  const selectedSentences = sentences
+    .slice(0, sentenceCount);
+
+  const importantSentences =
+    selectedSentences.length > 0
+      ? selectedSentences
+      : [cleanText.slice(0, 1000)];
+
+  const keyPoints = sentences
+    .slice(0, 6)
+    .map((sentence) => `- ${sentence}`);
+
+  return `### Summary
+
+${importantSentences.join(" ")}
+
+### Key Points
+
+${keyPoints.length > 0
+    ? keyPoints.join("\n")
+    : "- The document text was successfully extracted."}
+
+### Improvement Suggestions
+
+- Organize the document into clearly separated sections.
+- Add concise headings where appropriate.
+- Include measurable details or supporting information where relevant.
+
+*Note: AI summarization was temporarily unavailable, so an automatic text-based summary was generated.*`;
 }
 
 export default async function handler(req, res) {
@@ -57,14 +57,6 @@ export default async function handler(req, res) {
   }
 
   try {
-    const apiKey = process.env.GEMINI_API_KEY;
-
-    if (!apiKey) {
-      return res.status(500).json({
-        error: "GEMINI_API_KEY is missing"
-      });
-    }
-
     const { text, length = "medium" } = req.body || {};
 
     if (!text || !text.trim()) {
@@ -73,116 +65,113 @@ export default async function handler(req, res) {
       });
     }
 
-    const ai = new GoogleGenAI({
-      apiKey
-    });
+    const apiKey = process.env.GEMINI_API_KEY;
 
-    let instruction;
+    // Try Gemini first
+    if (apiKey) {
+      try {
+        const ai = new GoogleGenAI({
+          apiKey
+        });
 
-    if (length === "short") {
-      instruction = `
-Give:
-### Summary
-3-4 sentences.
+        let instruction = "";
 
+        if (length === "short") {
+          instruction = `
+Create a concise summary in 3-4 sentences.
+
+Then provide:
 ### Key Points
-Exactly 5 bullets.
+Exactly 5 bullet points.
 
 ### Improvement Suggestions
-Exactly 2 bullets.
-`;
-    } else if (length === "long") {
-      instruction = `
-Give:
-### Summary
-2 short paragraphs.
+Exactly 2 bullet points.
 
+Keep the response concise.
+`;
+        } else if (length === "long") {
+          instruction = `
+Create a detailed summary in 2 short paragraphs.
+
+Then provide:
 ### Key Points
-Exactly 7 bullets.
+Exactly 7 bullet points.
 
 ### Improvement Suggestions
-Exactly 3 bullets.
-`;
-    } else {
-      instruction = `
-Give:
-### Summary
-1 short paragraph.
+Exactly 3 bullet points.
 
+Keep the response concise.
+`;
+        } else {
+          instruction = `
+Create a medium-length summary in 1 short paragraph.
+
+Then provide:
 ### Key Points
-Exactly 6 bullets.
+Exactly 6 bullet points.
 
 ### Improvement Suggestions
-Exactly 3 bullets.
-`;
-    }
+Exactly 3 bullet points.
 
-    const prompt = `
-You are a document summarization assistant.
+Keep the response concise.
+`;
+        }
+
+        const prompt = `
+You are a professional document summarization assistant.
 
 ${instruction}
 
 Rules:
-- Use ONLY information from the document.
+- Use only information present in the document.
 - Do not invent facts.
-- Keep the answer concise.
-- Finish every section.
-- Preserve important names, dates and numbers.
+- Preserve important names, dates, numbers and technical terms.
+- Finish every section completely.
 - Do not use tables.
 
 DOCUMENT:
 ${text}
 `;
 
-    // Try the latest stable aliases/models in sequence.
-    const models = [
-      "gemini-flash-latest",
-      "gemini-flash-lite-latest",
-      "gemini-3.6-flash",
-      "gemini-2.5-flash"
-    ];
-
-    let finalError = null;
-
-    for (const model of models) {
-      try {
-        const summary = await generateWithRetry(
-          ai,
-          model,
-          prompt
-        );
-
-        return res.status(200).json({
-          summary
+        const response = await ai.models.generateContent({
+          model: "gemini-3.7-flash",
+          contents: prompt,
+          config: {
+            maxOutputTokens: 1000
+          }
         });
-      } catch (error) {
-        finalError = error;
 
-        const status =
-          error?.status ||
-          error?.statusCode ||
-          error?.code;
+        const summary = response.text?.trim();
 
-        // Move to the next model only for temporary availability errors.
-        if (status === 503 || status === 429) {
-          continue;
+        if (summary) {
+          return res.status(200).json({
+            summary,
+            source: "gemini"
+          });
         }
-
-        throw error;
+      } catch (geminiError) {
+        console.error(
+          "Gemini temporarily unavailable:",
+          geminiError?.message
+        );
       }
     }
 
-    return res.status(503).json({
-      error:
-        "Gemini is temporarily busy. Please try Generate Summary again in a few seconds."
+    // Guaranteed fallback
+    const fallbackSummary = createFallbackSummary(
+      text,
+      length
+    );
+
+    return res.status(200).json({
+      summary: fallbackSummary,
+      source: "fallback"
     });
   } catch (error) {
     console.error("Summary API error:", error);
 
     return res.status(500).json({
-      error:
-        error?.message ||
-        "Failed to generate summary."
+      error: "Unable to process the document."
     });
   }
 }
